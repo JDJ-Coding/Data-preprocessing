@@ -32,7 +32,7 @@ def call_corporate_ai_api(prompt_text):
         return "[설정 오류] 환경변수 POSCO_GPT_KEY가 없습니다."
 
     try:
-        url = "http://aigpt.posco.net/gpgpt/a01-gpt/gptApi/personalApi"
+        url = "http://aigpt.posco.net/gpgpta01-gpt/gptApi/personalApi"
 
         token_value = POSCO_GPT_KEY
         if not token_value.startswith("Bearer "):
@@ -293,25 +293,28 @@ def create_smart_report(df_summary, output_path):
         print(f" > Analyzing: {row['명칭']} (변화율: {row['변화율(%)']})%)")
 
         prompt = f"""
-[상황]
-공장 설비 센서 데이터에서 머신러닝 모델이 평소와 다른 패턴을 감지했습니다.
-이것이 단순 노이즈인지, 실제 설비 고장의 전조인지 판단해 주십시오.
+[역할]
+당신은 포스코 퓨처엠 설비 예지보전 전문가입니다.
+현장 엔지니어가 엑셀에서 바로 읽을 수 있도록 매우 간결하게 작성하십시오.
 
-[센서 정보]
-- 센서명: {row['명칭']} (Tag: {row['iba Tag']})
+[분석 데이터]
+- 전체 데이터 개수: {len(df_summary)}
+- 이상치 개수: {row['이상징후 건수']}
 - 정상 평균: {row['정상 평균']}
-- 현재 이상값 평균: {row['이상 구간 평균']} ({row['변화율(%)']})% {row['패턴 유형']})
-- 이상 발생 빈도: 전체 데이터 중 {row['이상징후 건수']}건 감지됨
+- 이상 구간 평균: {row['이상 구간 평균']}
+- 변화율: {row['변화율(%)']}%
+- 패턴 유형: {row['패턴 유형']}
 
-[판단 기준]
-1. 변화율이 1~2% 내외로 미미하다면 'Low' (단, 압력/진동 등 민감 센서는 예외)
-2. 수치가 급격히 튀었다면 'High'
-3. 센서 이름을 보고 설비 특성을 유추하여 위험도를 평가하시오.
+[출력 규칙 – 매우 중요]
+1. 반드시 아래 형식만 사용하십시오.
+2. 각 항목은 한 문장만 작성하십시오.
+3. 불필요한 설명, 서론, 결론, 목록 추가 금지.
+4. 고장 위험도는 반드시 % 숫자로 명시하십시오.
 
-[필수 출력 포맷]
-- 위험도: [Low / Medium / High] 중 택1
-- 진단: (한 줄 요약)
-- 조치: (엔지니어에게 권장하는 행동)
+[출력 형식]
+1. 데이터 분석결과 : 전체 XXX개 중 이상치 XX개 검출
+2. 분석결과 근거 : 정상 평균 XXX, 이상 평균 XXX로 평균 편차 발생
+3. 최종결과 : 데이터 상태가 ○○ 패턴으로 고장 위험도 XX%
 """
 
         ai_result = call_corporate_ai_api(prompt)
