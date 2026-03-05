@@ -32,31 +32,30 @@ def call_corporate_ai_api(prompt_text):
         return "[설정 오류] 환경변수 POSCO_GPT_KEY가 없습니다."
 
     try:
-        url = "http://aigpt.posco.net/gpgpta01-gpt/gptApi/personalApi"
-        
+        url = "http://aigpt.posco.net/gpgpt/a01-gpt/gptApi/personalApi"
+
         token_value = POSCO_GPT_KEY
         if not token_value.startswith("Bearer "):
             token_value = f"Bearer {token_value}"
-            
+
         headers = {
             "Authorization": token_value,
             "Content-Type": "application/json"
         }
-        
-        # AI가 분석가처럼 행동하도록 온도(Temperature)를 낮춰서 설정
+
         payload = {
             "model": "gpt-5.2",
             "messages": [
                 {"role": "system", "content": "당신은 포스코 퓨처엠의 설비 예지보전 전문가입니다. 수치를 기반으로 냉철하게 설비 위험도를 판단하십시오."},
                 {"role": "user", "content": prompt_text}
             ],
-            "frequency_penalty": 0.0, 
-            "temperature": 0.3 
+            "frequency_penalty": 0.0,
+            "temperature": 0.3
         }
-        
+
         response = requests.post(url, headers=headers, json=payload, timeout=60)
         response.encoding = 'utf-8'
-        
+
         if response.status_code == 200:
             try:
                 result = response.json()
@@ -74,7 +73,6 @@ def call_corporate_ai_api(prompt_text):
     except Exception as e:
         return f"[시스템 오류] {str(e)}"
 
-
 # ==========================================
 # 1. 데이터 로드 (안정성 강화 버전)
 # ==========================================
@@ -82,54 +80,51 @@ def load_data(path):
     print(f"[1/4] 데이터 로딩 중: {os.path.basename(path)}")
     encodings = ['cp949', 'euc-kr', 'utf-8']
     df_raw = None
-    separators = [',', ';', '\t'] 
-    
-    # 다양한 인코딩과 구분자로 읽기 시도
+    separators = [',', ';', '\t']
+
     for sep in separators:
         for enc in encodings:
             try:
                 df_raw = pd.read_csv(path, sep=sep, header=None, encoding=enc, low_memory=False)
-                if df_raw.shape[1] > 1: # 컬럼이 1개 이상이어야 정상
+                if df_raw.shape[1] > 1:
                     break
                 else:
-                    df_raw = None 
-            except: continue
-        if df_raw is not None: break
+                    df_raw = None
+            except:
+                continue
+        if df_raw is not None:
+            break
 
     if df_raw is None or len(df_raw) < 3:
         raise ValueError("파일을 읽을 수 없습니다. (형식이 올바르지 않음)")
 
-    # 1행: Tag, 2행: Name
     tags = df_raw.iloc[0].astype(str).str.strip()
     names = df_raw.iloc[1].astype(str).str.strip()
-    
-    # 시간 컬럼 찾기
+
     time_col_idx = 0
     for i, val in enumerate(names):
         if 'time' in val.lower() or 'date' in val.lower():
-            time_col_idx = i; break
-            
+            time_col_idx = i
+            break
+
     sensor_map = {}
     valid_indices = []
-    
-    # 센서 매핑 정보 구축
+
     for i in range(len(df_raw.columns)):
-        if i == time_col_idx: continue
-        # 태그나 이름이 비어있으면 스킵
-        if not tags.iloc[i] or tags.iloc[i] == 'nan': continue
-        
+        if i == time_col_idx:
+            continue
+        if not tags.iloc[i] or tags.iloc[i] == 'nan':
+            continue
         sensor_map[i] = {'tag': tags.iloc[i], 'name': names.iloc[i]}
         valid_indices.append(i)
 
-    # 실제 데이터 부분 (3행부터)
     df_data = df_raw.iloc[2:].copy()
     df_data.rename(columns={time_col_idx: 'Time'}, inplace=True)
-    
-    # 숫자 변환 및 결측치 보정
+
     for i in valid_indices:
         df_data[i] = pd.to_numeric(df_data[i], errors='coerce')
-        # 선형 보간 후 앞뒤 채우기
-        df_data[i] = df_data[i].interpolate(method='linear').fillna(method='bfill').fillna(0)
+        # ✅ 수정: fillna(method='bfill') → bfill() (pandas 2.x 호환)
+        df_data[i] = df_data[i].interpolate(method='linear').bfill().fillna(0)
 
     return df_data, sensor_map
 
@@ -139,42 +134,35 @@ def load_data(path):
 def analyze_with_ml(df, sensor_map):
     print("[2/4] 머신러닝 분석 중 (모든 이상 징후 탐색)...")
     results = []
-    
-    # 오염도 0.01 = 상위 1%의 특이값은 무조건 잡겠다
+
     clf = IsolationForest(contamination=0.01, random_state=42, n_jobs=-1)
-    
+
     for col_idx, meta in sensor_map.items():
         series = df[col_idx]
-        
-        # 값이 완전히 고정된 경우(표준편차 0)는 분석 가치 없음
-        if series.std() == 0: continue
 
-        # 디지털 신호(0, 1만 있는 경우) 제외 -> 아날로그만 분석
+        if series.std() == 0:
+            continue
+
         unique_vals = np.unique(series.dropna())
         if set(unique_vals).issubset({0, 1, 0.0, 1.0}):
             continue
 
-        # 학습 및 예측
         X = series.values.reshape(-1, 1)
         clf.fit(X)
         preds = clf.predict(X)
-        
-        # -1이 이상치(Anomaly)
+
         outlier_idx = np.where(preds == -1)[0]
         count = len(outlier_idx)
-        
+
         if count > 0:
             anomalies = series.iloc[outlier_idx]
             normal_mean = series.mean()
             anomaly_mean = anomalies.mean()
-            
-            # 변화율 계산 (절대값 기준)
+
             change_ratio = (abs(anomaly_mean - normal_mean) / (abs(normal_mean) + 1e-9)) * 100
-            
             direction = "상승(▲)" if anomaly_mean > normal_mean else "하강(▼)"
-            # 심각도 Score: 결정 경계에서 얼마나 멀리 떨어져 있는가
             score = abs(clf.decision_function(X)[outlier_idx].mean())
-            
+
             results.append({
                 'Col_Idx': col_idx,
                 'iba Tag': meta['tag'],
@@ -183,73 +171,166 @@ def analyze_with_ml(df, sensor_map):
                 '패턴 유형': direction,
                 '정상 평균': round(normal_mean, 2),
                 '이상 구간 평균': round(anomaly_mean, 2),
-                '변화율(%)': round(change_ratio, 2), # % 단위
+                '변화율(%)': round(change_ratio, 2),
                 'Max': round(anomalies.max(), 2),
                 'Min': round(anomalies.min(), 2),
                 '심각도': score
             })
-            
+
     if not results:
         return pd.DataFrame()
-        
-    # 심각도 순으로 정렬해서 반환
+
     return pd.DataFrame(results).sort_values(by='심각도', ascending=False)
 
 # ==========================================
-# 3. 엑셀 리포트 생성 & AI 판단 (정밀 거름망)
+# ✅ 추가: 메트릭 정의 시트 생성 함수
+# ==========================================
+def create_metrics_definition_sheet(wb):
+    ws_def = wb.create_sheet(title="메트릭 정의")
+
+    definition_data = [
+        ["헤더명", "영문 필드명", "데이터 출처", "계산 공식", "의미 및 해석", "주의사항"],
+        [
+            "이상징후 건수", "count",
+            "Isolation Forest 모델이 이상치(-1)로 판단한 데이터 포인트 개수",
+            "len(np.where(preds == -1)[0])",
+            "해당 센서에서 감지된 이상 데이터 포인트의 총 개수. 값이 클수록 이상 발생 빈도가 높음",
+            "contamination=0.01 → 전체 데이터의 상위 1%를 이상치로 가정"
+        ],
+        [
+            "패턴 유형", "direction",
+            "이상 구간 평균과 정상 평균을 비교한 방향성",
+            "'상승(▲)' if anomaly_mean > normal_mean else '하강(▼)'",
+            "이상치가 정상 대비 높은 값(상승) 또는 낮은 값(하락)인지 방향성 표시",
+            "단순 평균 비교이므로, 센서 특성에 따라 의미가 다를 수 있음"
+        ],
+        [
+            "정상 평균", "normal_mean",
+            "전체 센서 시계열 데이터의 산술평균",
+            "series.mean()",
+            "센서의 정상 작동 시 기준값. 전체 데이터의 평균으로 정상 상태를 대표",
+            "표준편차가 0이거나 0/1만 있는 디지털 센서는 분석에서 제외됨"
+        ],
+        [
+            "이상 구간 평균", "anomaly_mean",
+            "Isolation Forest가 이상치(-1)로 판정한 데이터 포인트만의 평균값",
+            "series.iloc[outlier_idx].mean()",
+            "이상 발생 시점의 평균값. 정상 평균과 비교하여 이상 정도 파악",
+            "정상 평균이 0에 가까우면 변화율이 과도하게 클 수 있음"
+        ],
+        [
+            "변화율(%)", "change_ratio",
+            "정상 평균 대비 이상 구간 평균의 차이 비율",
+            "abs(anomaly_mean - normal_mean) / (abs(normal_mean) + 1e-9) * 100",
+            "정상 대비 이상치가 얼마나 벗어났는지 백분율로 표시. 높을수록 이상 정도가 큼",
+            "분모가 0이 되는 것을 막기 위해 1e-9(매우 작은 수)를 더해 보정"
+        ],
+        [
+            "Max", "anomalies.max()",
+            "이상치로 판정된 데이터 포인트 중 최댓값",
+            "series.iloc[outlier_idx].max()",
+            "이상 구간에서 기록된 최고값. 센서 값의 상한 이탈 정도 파악",
+            "순간 스파이크(노이즈)도 포함될 수 있음"
+        ],
+        [
+            "Min", "anomalies.min()",
+            "이상치로 판정된 데이터 포인트 중 최솟값",
+            "series.iloc[outlier_idx].min()",
+            "이상 구간에서 기록된 최저값. 센서 값의 하한 이탈 정도 파악",
+            "순간 드롭(노이즈)도 포함될 수 있음"
+        ],
+        [
+            "심각도", "score",
+            "Isolation Forest의 decision_function 결과 절댓값 평균",
+            "abs(clf.decision_function(X)[outlier_idx].mean())",
+            "머신러닝 모델이 계산한 이상도 점수. 높을수록 정상 패턴에서 크게 벗어남. 결과 정렬 기준",
+            "decision_function은 음수일수록 이상치에 가까움. 절댓값으로 변환하여 사용"
+        ],
+    ]
+
+    fill_header = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type='solid')
+    font_header = Font(color="FFFFFF", bold=True)
+    border_thin = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+    fill_row = PatternFill(start_color="DEEAF1", end_color="DEEAF1", fill_type='solid')
+
+    col_widths = [15, 18, 40, 48, 60, 45]
+
+    for row_idx, row_data in enumerate(definition_data, 1):
+        for col_idx, val in enumerate(row_data, 1):
+            cell = ws_def.cell(row=row_idx, column=col_idx, value=val)
+            cell.border = border_thin
+            cell.alignment = Alignment(wrap_text=True, vertical='top')
+
+            if row_idx == 1:
+                cell.fill = fill_header
+                cell.font = font_header
+                cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+            elif row_idx % 2 == 0:
+                cell.fill = fill_row
+
+    for i, width in enumerate(col_widths, 1):
+        ws_def.column_dimensions[openpyxl.utils.get_column_letter(i)].width = width
+
+    ws_def.row_dimensions[1].height = 20
+    for i in range(2, len(definition_data) + 1):
+        ws_def.row_dimensions[i].height = 55
+
+# ==========================================
+# 3. 엑셀 리포트 생성 & AI 판단
 # ==========================================
 def create_smart_report(df_summary, output_path):
     print("[3/4] AI(GPT) 정밀 진단 수행 중...")
-    
+
     df_summary['AI 위험도 판단'] = "분석 대기"
-    
-    # 상위 10개(또는 전체)에 대해 AI에게 물어봄
-    targets = df_summary.head(10) 
-    
+
+    targets = df_summary.head(10)
+
     for idx in targets.index:
         row = df_summary.loc[idx]
-        print(f"   > Analyzing: {row['명칭']} (변화율: {row['변화율(%)']}%)")
-        
-        # ★ [핵심] AI에게 '판단'을 시키는 프롬프트
+        print(f" > Analyzing: {row['명칭']} (변화율: {row['변화율(%)']})%)")
+
         prompt = f"""
-        [상황]
-        공장 설비 센서 데이터에서 머신러닝 모델이 평소와 다른 패턴을 감지했습니다.
-        이것이 단순 노이즈인지, 실제 설비 고장의 전조인지 판단해 주십시오.
+[상황]
+공장 설비 센서 데이터에서 머신러닝 모델이 평소와 다른 패턴을 감지했습니다.
+이것이 단순 노이즈인지, 실제 설비 고장의 전조인지 판단해 주십시오.
 
-        [센서 정보]
-        - 센서명: {row['명칭']} (Tag: {row['iba Tag']})
-        - 정상 평균: {row['정상 평균']}
-        - 현재 이상값 평균: {row['이상 구간 평균']} ({row['변화율(%)']}% {row['패턴 유형']})
-        - 이상 발생 빈도: 전체 데이터 중 {row['이상징후 건수']}건 감지됨
+[센서 정보]
+- 센서명: {row['명칭']} (Tag: {row['iba Tag']})
+- 정상 평균: {row['정상 평균']}
+- 현재 이상값 평균: {row['이상 구간 평균']} ({row['변화율(%)']})% {row['패턴 유형']})
+- 이상 발생 빈도: 전체 데이터 중 {row['이상징후 건수']}건 감지됨
 
-        [판단 기준]
-        1. 변화율이 1~2% 내외로 미미하다면 'Low' (단, 압력/진동 등 민감 센서는 예외)
-        2. 수치가 급격히 튀었다면 'High'
-        3. 센서 이름을 보고 설비 특성을 유추하여 위험도를 평가하시오.
+[판단 기준]
+1. 변화율이 1~2% 내외로 미미하다면 'Low' (단, 압력/진동 등 민감 센서는 예외)
+2. 수치가 급격히 튀었다면 'High'
+3. 센서 이름을 보고 설비 특성을 유추하여 위험도를 평가하시오.
 
-        [필수 출력 포맷]
-        - 위험도: [Low / Medium / High] 중 택1
-        - 진단: (한 줄 요약)
-        - 조치: (엔지니어에게 권장하는 행동)
-        """
-        
+[필수 출력 포맷]
+- 위험도: [Low / Medium / High] 중 택1
+- 진단: (한 줄 요약)
+- 조치: (엔지니어에게 권장하는 행동)
+"""
+
         ai_result = call_corporate_ai_api(prompt)
         df_summary.loc[idx, 'AI 위험도 판단'] = ai_result
 
     print(f"[4/4] 엑셀 파일 저장 중: {output_path}")
-    
-    # 엑셀 저장
+
     wb = openpyxl.Workbook()
     ws = wb.active
     ws.title = "AI Smart Report"
-    
-    # 스타일 정의
+
     fill_header = PatternFill(start_color="1F4E79", end_color="1F4E79", fill_type='solid')
-    fill_high = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type='solid') # 빨강 (High)
+    fill_high = PatternFill(start_color="FFC7CE", end_color="FFC7CE", fill_type='solid')
     font_header = Font(color="FFFFFF", bold=True)
-    border_thin = Border(left=Side(style='thin'), right=Side(style='thin'), top=Side(style='thin'), bottom=Side(style='thin'))
-    
-    # 헤더 쓰기
+    border_thin = Border(
+        left=Side(style='thin'), right=Side(style='thin'),
+        top=Side(style='thin'), bottom=Side(style='thin')
+    )
+
     cols = [c for c in df_summary.columns if c != 'Col_Idx']
     for i, col in enumerate(cols):
         cell = ws.cell(row=1, column=i+1, value=col)
@@ -258,24 +339,23 @@ def create_smart_report(df_summary, output_path):
         cell.border = border_thin
         cell.alignment = Alignment(horizontal='center', vertical='center')
 
-    # 데이터 쓰기
     for r_idx, row in enumerate(dataframe_to_rows(df_summary[cols], index=False, header=False), 2):
         for c_idx, val in enumerate(row):
             cell = ws.cell(row=r_idx, column=c_idx+1, value=val)
             cell.border = border_thin
-            
-            # AI 판단 컬럼(마지막)은 줄바꿈 허용 및 왼쪽 정렬
+
             if c_idx == len(cols) - 1:
                 cell.alignment = Alignment(wrap_text=True, vertical='top')
-                # 위험도가 High면 빨간색 표시
                 if "High" in str(val):
                     cell.fill = fill_high
             else:
                 cell.alignment = Alignment(horizontal='center', vertical='center')
 
-    # 컬럼 너비 자동 조정 (대략)
-    ws.column_dimensions['C'].width = 30 # 명칭
-    ws.column_dimensions[openpyxl.utils.get_column_letter(len(cols))].width = 60 # AI 결과
+    ws.column_dimensions['C'].width = 30
+    ws.column_dimensions[openpyxl.utils.get_column_letter(len(cols))].width = 60
+
+    # ✅ 추가: 메트릭 정의 시트 생성
+    create_metrics_definition_sheet(wb)
 
     wb.save(output_path)
 
@@ -284,9 +364,9 @@ def create_smart_report(df_summary, output_path):
 # ==========================================
 def main():
     print("=== [POSCO Future M] AI 예지보전 시스템 가동 ===")
-    
+
     root = tk.Tk()
-    root.withdraw() 
+    root.withdraw()
     root.attributes('-topmost', True)
 
     if not POSCO_GPT_KEY:
@@ -295,35 +375,31 @@ def main():
     while True:
         file_path = filedialog.askopenfilename(
             parent=root,
-            title="분석할 센서 데이터 파일(CSV) 선택", 
+            title="분석할 센서 데이터 파일(CSV) 선택",
             filetypes=[("CSV Files", "*.csv"), ("All Files", "*.*")]
         )
-        
+
         if not file_path:
             print(">> 종료합니다.")
             break
-        
+
         try:
-            # 1. 데이터 로드
             df, sensor_map = load_data(file_path)
-            
-            # 2. 머신러닝 분석
             df_result = analyze_with_ml(df, sensor_map)
-            
+
             if df_result.empty:
                 messagebox.showinfo("결과", "분석 가능한 아날로그 신호에서 특이점이 발견되지 않았습니다.")
             else:
-                # 3. 리포트 생성 (AI 판단 포함)
                 timestamp = datetime.now().strftime('%H%M%S')
                 base_name = os.path.basename(file_path).rsplit('.', 1)[0]
                 output_file = f"SmartReport_{base_name}_{timestamp}.xlsx"
-                
+
                 create_smart_report(df_result, output_file)
-                
+
                 msg = f"분석 완료!\n\n저장 위치: {output_file}\n\n계속 분석하시겠습니까?"
                 if not messagebox.askyesno("완료", msg, parent=root):
                     break
-                    
+
         except Exception as e:
             print(f"[Error] {e}")
             messagebox.showerror("오류", f"처리 중 오류가 발생했습니다:\n{str(e)}", parent=root)
